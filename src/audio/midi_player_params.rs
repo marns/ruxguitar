@@ -14,6 +14,10 @@ pub struct MidiPlayerParams {
     // pending count-in request: total ticks (high) | beat ticks (low), 0 = none
     count_in_request: AtomicU64,
     master_volume: AtomicU32, // f32 bits
+    // active loop: start tick (high) | end tick (low), 0 = none
+    loop_range: AtomicU64,
+    // tempo in effect at the loop start, restored on every wrap
+    loop_tempo: AtomicU32,
 }
 
 impl MidiPlayerParams {
@@ -28,6 +32,8 @@ impl MidiPlayerParams {
             finished: AtomicBool::new(false),
             count_in_request: AtomicU64::new(0),
             master_volume: AtomicU32::new(1.0_f32.to_bits()),
+            loop_range: AtomicU64::new(0),
+            loop_tempo: AtomicU32::new(tempo),
         }
     }
 
@@ -67,6 +73,31 @@ impl MidiPlayerParams {
         match self.count_in_request.swap(0, Ordering::Relaxed) {
             0 => None,
             packed => Some(((packed >> 32) as u32, packed as u32)),
+        }
+    }
+
+    /// Loop playback over `[start_tick, end_tick)` at `start_tempo`, or stop looping.
+    pub fn set_loop(&self, range: Option<(u32, u32, u32)>) {
+        match range {
+            Some((start_tick, end_tick, start_tempo)) => {
+                // tempo first: the audio callback reads it after the range
+                self.loop_tempo.store(start_tempo, Ordering::Relaxed);
+                let packed = (u64::from(start_tick) << 32) | u64::from(end_tick);
+                self.loop_range.store(packed, Ordering::Release);
+            }
+            None => self.loop_range.store(0, Ordering::Release),
+        }
+    }
+
+    /// The active loop: `(start tick, end tick, tempo at start)`.
+    pub fn loop_range(&self) -> Option<(u32, u32, u32)> {
+        match self.loop_range.load(Ordering::Acquire) {
+            0 => None,
+            packed => Some((
+                (packed >> 32) as u32,
+                packed as u32,
+                self.loop_tempo.load(Ordering::Relaxed),
+            )),
         }
     }
 
@@ -129,5 +160,20 @@ impl MidiPlayerParams {
     pub fn set_tempo_percentage(&self, tempo_percentage: u32) {
         self.tempo_percentage
             .store(tempo_percentage, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_range_round_trips() {
+        let params = MidiPlayerParams::new(120, 100, None);
+        assert_eq!(params.loop_range(), None);
+        params.set_loop(Some((960, 7680, 90)));
+        assert_eq!(params.loop_range(), Some((960, 7680, 90)));
+        params.set_loop(None);
+        assert_eq!(params.loop_range(), None);
     }
 }

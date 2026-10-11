@@ -18,6 +18,8 @@ pub struct Tablature {
     viewport_height: f32,   // visible height of the tablature container
     page_top_line: u32,     // line currently shown at the top of the view
     focused_measure: usize,
+    /// Looped measures, first and last inclusive.
+    loop_range: Option<(usize, usize)>,
     line_tracker: LineTracker,
     pub scroll_id: Id,
     measure_per_tick: BTreeMap<u32, u32>, // tick to measure index as u32
@@ -46,6 +48,7 @@ impl Tablature {
             viewport_height: 0.0,
             page_top_line: 1,
             focused_measure: 0,
+            loop_range: None,
             line_tracker: LineTracker::default(),
             scroll_id,
             measure_per_tick,
@@ -66,7 +69,7 @@ impl Tablature {
                 self.song.measure_headers[i].time_signature
                     != self.song.measure_headers[previous].time_signature
             });
-            let measure = CanvasMeasure::new(
+            let mut measure = CanvasMeasure::new(
                 i,
                 self.track_id,
                 self.song.clone(),
@@ -74,6 +77,7 @@ impl Tablature {
                 has_time_signature,
                 syllables.get(i).cloned().unwrap_or_default(),
             );
+            measure.set_in_loop(self.is_in_loop(i));
             self.canvas_measures.push(measure);
         }
         // recompute line tracker with existing width
@@ -229,6 +233,24 @@ impl Tablature {
 
     pub const fn focused_measure(&self) -> usize {
         self.focused_measure
+    }
+
+    pub const fn loop_range(&self) -> Option<(usize, usize)> {
+        self.loop_range
+    }
+
+    fn is_in_loop(&self, measure_id: usize) -> bool {
+        self.loop_range
+            .is_some_and(|(first, last)| (first..=last).contains(&measure_id))
+    }
+
+    /// Loop over the measures `first..=last`, or stop looping.
+    pub fn set_loop_range(&mut self, loop_range: Option<(usize, usize)>) {
+        self.loop_range = loop_range;
+        for i in 0..self.canvas_measures.len() {
+            let in_loop = self.is_in_loop(i);
+            self.canvas_measures[i].set_in_loop(in_loop);
+        }
     }
 
     pub const fn measure_count(&self) -> usize {
@@ -412,6 +434,41 @@ impl LineTracker {
     /// Number of lines, or `None` when there is no measure at all.
     fn line_count(&self) -> Option<usize> {
         self.measure_to_line.last().map(|&last| last as usize)
+    }
+}
+
+/// The loop after shift+clicking `measure_id`: a measure outside the loop
+/// extends it, one inside removes itself and everything up to the nearer
+/// end (the last end on a tie). Without a loop, it spans from `focused`.
+pub fn shift_click_loop(
+    loop_range: Option<(usize, usize)>,
+    focused: usize,
+    measure_id: usize,
+) -> Option<(usize, usize)> {
+    let Some((first, last)) = loop_range else {
+        return Some((focused.min(measure_id), focused.max(measure_id)));
+    };
+    if measure_id < first {
+        Some((measure_id, last))
+    } else if measure_id > last {
+        Some((first, measure_id))
+    } else if first == last {
+        // removing the only measure ends the loop
+        None
+    } else if measure_id - first < last - measure_id {
+        Some((measure_id + 1, last))
+    } else {
+        Some((first, measure_id - 1))
+    }
+}
+
+/// The fixed end of a drag starting on `measure_id`: grabbing an end of a
+/// multi-measure loop moves that end, anywhere else starts a new loop.
+pub fn drag_anchor(loop_range: Option<(usize, usize)>, measure_id: usize) -> usize {
+    match loop_range {
+        Some((first, last)) if first != last && measure_id == first => last,
+        Some((first, last)) if first != last && measure_id == last => first,
+        _ => measure_id,
     }
 }
 
@@ -648,5 +705,34 @@ mod tests {
             prev_line = line;
         }
         assert_eq!(first_on_line, vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn shift_click_extends_and_trims_the_loop() {
+        // no loop: from the focused measure, either direction
+        assert_eq!(shift_click_loop(None, 5, 8), Some((5, 8)));
+        assert_eq!(shift_click_loop(None, 5, 2), Some((2, 5)));
+        // outside: extend on either side
+        assert_eq!(shift_click_loop(Some((8, 16)), 0, 4), Some((4, 16)));
+        assert_eq!(shift_click_loop(Some((8, 16)), 0, 20), Some((8, 20)));
+        // inside: drop the clicked measure and those up to the nearer end
+        assert_eq!(shift_click_loop(Some((8, 16)), 0, 8), Some((9, 16)));
+        assert_eq!(shift_click_loop(Some((8, 16)), 0, 9), Some((10, 16)));
+        assert_eq!(shift_click_loop(Some((8, 16)), 0, 16), Some((8, 15)));
+        assert_eq!(shift_click_loop(Some((8, 16)), 0, 15), Some((8, 14)));
+        assert_eq!(shift_click_loop(Some((8, 16)), 0, 12), Some((8, 11)));
+        // the last measure of the loop ends it
+        assert_eq!(shift_click_loop(Some((8, 8)), 0, 8), None);
+    }
+
+    #[test]
+    fn dragging_a_loop_end_moves_that_end() {
+        assert_eq!(drag_anchor(Some((8, 16)), 8), 16);
+        assert_eq!(drag_anchor(Some((8, 16)), 16), 8);
+        // the middle of the loop, outside it, or no loop: a fresh selection
+        assert_eq!(drag_anchor(Some((8, 16)), 12), 12);
+        assert_eq!(drag_anchor(Some((8, 16)), 3), 3);
+        assert_eq!(drag_anchor(Some((8, 8)), 8), 8);
+        assert_eq!(drag_anchor(None, 8), 8);
     }
 }

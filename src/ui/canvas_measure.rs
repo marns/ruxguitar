@@ -7,6 +7,7 @@ use crate::ui::application::Message;
 use crate::ui::utils::TablatureColors;
 use iced::advanced::mouse;
 use iced::advanced::text::Shaping::Auto;
+use iced::keyboard;
 use iced::mouse::Cursor;
 use iced::widget::canvas::{Cache, Event, Frame, Geometry, LineDash, Path, Stroke, Text};
 use iced::widget::text::Alignment;
@@ -273,6 +274,8 @@ pub struct CanvasMeasure {
     song: Rc<Song>,
     is_focused: bool,
     focused_beat: usize,
+    /// Part of the looped section.
+    in_loop: bool,
     canvas_cache: Cache,
     measure_len: f32,
     // natural width of each beat and their sum (immutable song data,
@@ -372,6 +375,7 @@ impl CanvasMeasure {
             song,
             is_focused: focused,
             focused_beat: 0,
+            in_loop: false,
             canvas_cache: Cache::default(),
             measure_len,
             beat_widths,
@@ -443,6 +447,13 @@ impl CanvasMeasure {
         }
     }
 
+    pub fn set_in_loop(&mut self, in_loop: bool) {
+        if self.in_loop != in_loop {
+            self.in_loop = in_loop;
+            self.canvas_cache.clear();
+        }
+    }
+
     pub fn clear_canvas_cache(&self) {
         self.canvas_cache.clear();
     }
@@ -482,11 +493,13 @@ impl CanvasMeasure {
     }
 }
 
+/// Canvas state, tracked from events reaching every measure: shift for
+/// shift+click, and a held button for drag selection across measures.
 #[derive(Debug, Default)]
-pub enum MeasureInteraction {
-    #[default]
-    None,
-    Clicked,
+pub struct MeasureInteraction {
+    shift: bool,
+    button_down: bool,
+    hovered: bool,
 }
 
 impl canvas::Program<Message> for CanvasMeasure {
@@ -499,18 +512,39 @@ impl canvas::Program<Message> for CanvasMeasure {
         bounds: Rectangle,
         cursor: Cursor,
     ) -> Option<Action<Message>> {
-        if let Event::Mouse(mouse::Event::ButtonPressed(_)) = event
-            && let Some(cursor_position) = cursor.position_in(bounds)
-        {
-            let beat_id = self.beat_at_x(cursor_position.x, bounds.width);
-            log::info!("Clicked on measure {} beat {beat_id}", self.measure_id);
-            *state = MeasureInteraction::Clicked;
-            return Some(Action::publish(Message::FocusMeasure(
-                self.measure_id,
-                beat_id,
-            )));
+        match event {
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.shift = modifiers.shift();
+                None
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(button)) => {
+                state.button_down = *button == mouse::Button::Left;
+                let cursor_position = cursor.position_in(bounds)?;
+                if state.shift {
+                    log::info!("Shift-clicked on measure {}", self.measure_id);
+                    return Some(Action::publish(Message::ShiftClickMeasure(self.measure_id)));
+                }
+                let beat_id = self.beat_at_x(cursor_position.x, bounds.width);
+                log::info!("Clicked on measure {} beat {beat_id}", self.measure_id);
+                Some(Action::publish(Message::FocusMeasure(
+                    self.measure_id,
+                    beat_id,
+                )))
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                state.button_down = false;
+                None
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                // report a held drag once, as it enters this measure
+                let inside = cursor.is_over(bounds);
+                let entered = inside && !state.hovered;
+                state.hovered = inside;
+                (entered && state.button_down)
+                    .then(|| Action::publish(Message::DragOverMeasure(self.measure_id)))
+            }
+            _ => None,
         }
-        None
     }
 
     fn draw(
@@ -547,6 +581,18 @@ impl canvas::Program<Message> for CanvasMeasure {
             let measure_start_x = 0.0;
             let rows = self.row_spacing;
             let measure_start_y = rows.first_string_y();
+
+            // tint the looped section behind everything else
+            if self.in_loop {
+                draw_loop_tint(
+                    frame,
+                    colors,
+                    actual_width,
+                    vertical_measure_height,
+                    measure_start_y,
+                    rows,
+                );
+            }
 
             // draw focused box
             if self.is_focused {
@@ -1300,6 +1346,28 @@ fn draw_focused_box(
         .with_width(1.0)
         .with_color(colors.foreground);
     frame.stroke_rectangle(top_left, rectangle_size, stroke);
+}
+
+/// The looped section's background: the focus box area, edge to edge so
+/// consecutive looped measures read as one band.
+fn draw_loop_tint(
+    frame: &mut Frame<Renderer>,
+    colors: TablatureColors,
+    total_measure_len: f32,
+    vertical_measure_height: f32,
+    measure_start_y: f32,
+    rows: RowSpacing,
+) {
+    let top = focus_box_top(rows, measure_start_y);
+    let bottom = rows.staff_footer - CANVAS_MARGIN;
+    frame.fill_rectangle(
+        Point::new(0.0, measure_start_y - top),
+        Size::new(total_measure_len, vertical_measure_height + top + bottom),
+        Color {
+            a: 0.12,
+            ..colors.accent
+        },
+    );
 }
 
 fn draw_measure_vertical_line(

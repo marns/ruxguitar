@@ -243,6 +243,24 @@ impl AudioPlayer {
         None
     }
 
+    /// Loop playback over the measures `first..=last`, or stop looping.
+    pub fn set_loop(&self, measures: Option<(usize, usize)>) {
+        let range = measures.map(|(first, last)| {
+            let start = self.measure_playback_ticks[first];
+            let last_header = &self.song.measure_headers[last];
+            let end = self.measure_playback_ticks[last] + last_header.length();
+            // a jump (D.S., coda) can play `last` before `first`: loop the first measure alone
+            let end = if end > start {
+                end
+            } else {
+                start + self.song.measure_headers[first].length()
+            };
+            (start, end, self.song.measure_headers[first].tempo.value)
+        });
+        log::info!("Loop range: {measures:?} -> ticks {range:?}");
+        self.player_params.set_loop(range);
+    }
+
     /// Seek to a measure, offset by `beat_tick_offset` ticks into it.
     pub fn focus_measure_at(&self, measure_id: usize, beat_tick_offset: u32) {
         log::debug!("Focus audio player on measure:{measure_id} (+{beat_tick_offset} ticks)");
@@ -366,6 +384,8 @@ fn new_output_stream(
                 count_in_next_click = 0.0;
             }
             let counting_in = count_in_left > 0.0;
+            // the loop start to jump back to, when this buffer crosses the loop end
+            let mut loop_wrap = None;
             if counting_in {
                 if count_in_next_click <= 0.0 {
                     // same layered click as the metronome
@@ -379,11 +399,17 @@ fn new_output_stream(
                 count_in_next_click -= ticks;
             } else {
                 sequencer_guard.advance(player_params.adjusted_tempo(), elapsed_secs);
+                // play up to the loop end, then wrap below
+                loop_wrap = stop_at_loop_end(&mut sequencer_guard, player_params.loop_range());
             }
             // process midi events for current tick
             let next_events = sequencer_guard.get_next_events();
             // the sequence is exhausted: wake the UI once to stop the transport
-            if next_events.is_none() && !player_params.is_finished() {
+            // a loop over the last measures can run out of events before its end
+            let inside_loop = player_params
+                .loop_range()
+                .is_some_and(|(_, end, _)| sequencer_guard.get_tick() < end);
+            if next_events.is_none() && !inside_loop && !player_params.is_finished() {
                 player_params.set_finished(true);
                 beat_notify.notify_one();
             }
@@ -465,6 +491,13 @@ fn new_output_stream(
                     }
                 }
             }
+            if let Some((start, tempo)) = loop_wrap {
+                // back to the loop start: the next advance plays its first events
+                sequencer_guard.set_tick(start);
+                synthesizer_guard.note_off_all(false);
+                synthesizer_guard.reset_all_controllers();
+                player_params.set_tempo(tempo);
+            }
             if render_len < frame_count {
                 // debug level: runs on the real-time audio thread
                 log::debug!(
@@ -498,6 +531,23 @@ fn new_output_stream(
         .play()
         .map_err(|e| AudioPlayerError::StreamError(e.to_string()))?;
     Ok(stream)
+}
+
+/// When the last advance crossed the loop end, pull the sequencer back to
+/// just before it and return the `(start tick, tempo)` to wrap to once the
+/// remaining events are played.
+fn stop_at_loop_end(
+    sequencer: &mut MidiSequencer,
+    loop_range: Option<(u32, u32, u32)>,
+) -> Option<(u32, u32)> {
+    let (start, end, tempo) = loop_range?;
+    // only when coming from inside: a seek past the loop plays on
+    if sequencer.get_last_tick() < end && sequencer.get_tick() >= end {
+        sequencer.clamp_tick(end - 1);
+        Some((start, tempo))
+    } else {
+        None
+    }
 }
 
 /// Interleave rendered stereo samples into the device's frame layout.
@@ -656,6 +706,60 @@ mod tests {
             }
         }
         assert!(clicks > 50, "expected metronome clicks, got {clicks}");
+    }
+
+    #[test]
+    fn loop_wraps_back_to_its_start() {
+        use crate::audio::playback_order::compute_playback_order;
+        use crate::parser::song_parser_tests::parse_gp_file;
+        use std::rc::Rc;
+        use tokio::sync::Notify;
+
+        let song = parse_gp_file("test-files/Demo v5.gp5").unwrap();
+        let tempo = song.tempo.value;
+        let song = Rc::new(song);
+        let order = compute_playback_order(&song.measure_headers);
+        let current_tick = Arc::new(AtomicU32::new(FIRST_TICK));
+        let notify = Arc::new(Notify::new());
+        let player =
+            AudioPlayer::new(song, tempo, 100, None, current_tick, notify, &order).unwrap();
+        player.set_loop(Some((2, 3)));
+        let (start, end, _) = player.player_params.loop_range().unwrap();
+        assert_eq!(start, player.measure_playback_ticks[2]);
+        assert!(end > player.measure_playback_ticks[3]);
+
+        let events = MidiBuilder::new().build_for_song_with_order(&player.song, &order);
+        let mut sequencer = MidiSequencer::new(events);
+        sequencer.set_tick(start);
+        let mut wraps = 0;
+        let mut played_start = 0;
+        for _ in 0..500 {
+            sequencer.advance(tempo, 0.1);
+            let wrap = stop_at_loop_end(&mut sequencer, player.player_params.loop_range());
+            let events = sequencer.get_next_events().expect("loop never runs dry");
+            // nothing past the loop end is ever played
+            assert!(events.iter().all(|e| e.tick < end));
+            played_start += events.iter().filter(|e| e.tick == start).count();
+            if let Some((wrap_start, _)) = wrap {
+                sequencer.set_tick(wrap_start);
+                wraps += 1;
+            }
+        }
+        assert!(wraps > 5, "expected several loop passes, got {wraps}");
+        // the events on the loop's first tick are replayed on every pass
+        assert!(played_start > wraps, "loop start skipped: {played_start}");
+    }
+
+    #[test]
+    fn seeking_past_the_loop_plays_on() {
+        let mut sequencer = MidiSequencer::new(vec![]);
+        sequencer.set_tick(5000);
+        sequencer.advance(120, 0.0); // init
+        sequencer.advance(120, 0.1);
+        assert_eq!(
+            stop_at_loop_end(&mut sequencer, Some((960, 1920, 120))),
+            None
+        );
     }
 
     #[test]

@@ -16,6 +16,10 @@ pub fn mute_icon<'a, Message>() -> Element<'a, Message> {
     text('M').into()
 }
 
+pub fn loop_icon<'a, Message>() -> Element<'a, Message> {
+    text('L').into()
+}
+
 pub fn metronome_icon<'a, Message>() -> Element<'a, Message> {
     // musical symbols live outside the basic plane: needs advanced shaping
     text('\u{1D15F}').shaping(Shaping::Advanced).into()

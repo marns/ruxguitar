@@ -40,6 +40,14 @@ impl MidiSequencer {
         self.needs_init = true;
     }
 
+    /// Pull the current tick back to `max_tick` if it went past it, so the
+    /// next events stop there (the loop end).
+    pub fn clamp_tick(&mut self, max_tick: u32) {
+        if self.tick_position > f64::from(max_tick) {
+            self.tick_position = f64::from(max_tick.max(self.last_tick));
+        }
+    }
+
     pub fn reset_ticks(&mut self) {
         self.set_tick(0);
     }

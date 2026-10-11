@@ -13,11 +13,11 @@ use crate::config::Config;
 use crate::parser::parse_gp_data;
 use crate::parser::song_parser::{GpVersion, MeasureHeader, QUARTER_TIME, Song};
 use crate::ui::icons::{
-    count_in_icon, metronome_icon, mute_icon, open_icon, pause_icon, play_icon, solo_icon,
-    stop_icon,
+    count_in_icon, loop_icon, metronome_icon, mute_icon, open_icon, pause_icon, play_icon,
+    solo_icon, stop_icon,
 };
 use crate::ui::picker::{FilePickerError, load_file, open_file_dialog};
-use crate::ui::tablature::Tablature;
+use crate::ui::tablature::{self, Tablature};
 use crate::ui::tuning::tuning_label;
 use crate::ui::utils::{action_gated, action_toggle, modal, untitled_text_table_box};
 use crate::{ApplicationArgs, ThemeChoice};
@@ -51,6 +51,17 @@ pub struct RuxApplication {
     config: Config,
     error_message: Option<String>,
     is_fullscreen: bool,
+    /// Loop selection being dragged across measures.
+    loop_drag: Option<LoopDrag>,
+}
+
+/// A drag selecting a loop: `anchor` is the fixed end, the other follows
+/// the cursor once it leaves the `origin` measure.
+#[derive(Debug, Clone, Copy)]
+struct LoopDrag {
+    anchor: usize,
+    origin: usize,
+    moved: bool,
 }
 
 #[derive(Debug)]
@@ -183,6 +194,14 @@ pub enum Message {
     ToggleMute,
     ToggleMetronome,
     ToggleCountIn,
+    /// Loop the focused measure, or stop looping.
+    ToggleLoop,
+    /// Extend the loop to a measure outside it, or trim it from one inside.
+    ShiftClickMeasure(usize),
+    /// A drag from a measure entered another measure.
+    DragOverMeasure(usize),
+    /// The mouse button was released anywhere: end a loop drag.
+    DragEnd,
     WindowResized,
     TablatureResized(Size),
     TempoSelected(TempoSelection),
@@ -215,6 +234,7 @@ impl RuxApplication {
             config,
             error_message: None,
             is_fullscreen: false,
+            loop_drag: None,
         }
     }
 
@@ -263,6 +283,32 @@ impl RuxApplication {
         scroll_offset.map_or_else(Task::none, |y| {
             scroll_to(scroll_id, AbsoluteOffset { x: 0.0, y })
         })
+    }
+
+    /// Apply a loop range to the tablature and the player, moving the cursor
+    /// into the loop if it sits outside.
+    fn set_loop_range(&mut self, loop_range: Option<(usize, usize)>) -> Task<Message> {
+        let Some(tablature) = &mut self.tablature else {
+            return Task::none();
+        };
+        tablature.set_loop_range(loop_range);
+        if let Some(audio_player) = &self.audio_player {
+            audio_player.set_loop(loop_range);
+        }
+        self.seek_into_loop()
+    }
+
+    /// Move the cursor to the loop start if it sits outside the loop.
+    fn seek_into_loop(&mut self) -> Task<Message> {
+        let Some(tablature) = &self.tablature else {
+            return Task::none();
+        };
+        match tablature.loop_range() {
+            Some((first, last)) if !(first..=last).contains(&tablature.focused_measure()) => {
+                self.focus_measure_with_scroll(first)
+            }
+            _ => Task::none(),
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -384,6 +430,16 @@ impl RuxApplication {
                 }
             }
             Message::FocusMeasure(measure_id, beat_id) => {
+                // a press starts a potential loop drag
+                let anchor = tablature::drag_anchor(
+                    self.tablature.as_ref().and_then(Tablature::loop_range),
+                    measure_id,
+                );
+                self.loop_drag = Some(LoopDrag {
+                    anchor,
+                    origin: measure_id,
+                    moved: false,
+                });
                 if let Some(tablature) = &mut self.tablature {
                     // focus measure and beat in tablature
                     tablature.focus_on_measure_beat(measure_id, beat_id);
@@ -439,13 +495,20 @@ impl RuxApplication {
                 if self.tab_file_is_loading {
                     return Task::none();
                 }
+                // start a loop from its first measure when the cursor is
+                // outside it (e.g. after a stop)
+                let seek = if self.audio_player.as_ref().is_some_and(|p| !p.is_playing()) {
+                    self.seek_into_loop()
+                } else {
+                    Task::none()
+                };
                 if let Some(audio_player) = &mut self.audio_player
                     && let Some(err) = audio_player.toggle_play()
                 {
                     return Task::done(Message::ReportError(err));
                 }
                 // Hack to make sure the tablature is aware of its size
-                Task::done(Message::WindowResized)
+                Task::batch([seek, Task::done(Message::WindowResized)])
             }
             Message::StopPlayer => {
                 if let (Some(audio_player), Some(tablature)) =
@@ -492,6 +555,51 @@ impl RuxApplication {
                 }
                 Task::none()
             }
+            Message::ToggleLoop => {
+                let Some(tablature) = &self.tablature else {
+                    return Task::none();
+                };
+                let loop_range = if tablature.loop_range().is_some() {
+                    None
+                } else {
+                    let focused = tablature.focused_measure();
+                    Some((focused, focused))
+                };
+                self.set_loop_range(loop_range)
+            }
+            Message::ShiftClickMeasure(measure_id) => {
+                let Some(tablature) = &self.tablature else {
+                    return Task::none();
+                };
+                self.loop_drag = None;
+                let loop_range = tablature::shift_click_loop(
+                    tablature.loop_range(),
+                    tablature.focused_measure(),
+                    measure_id,
+                );
+                self.set_loop_range(loop_range)
+            }
+            Message::DragOverMeasure(measure_id) => {
+                let (Some(drag), Some(tablature)) = (&mut self.loop_drag, &mut self.tablature)
+                else {
+                    return Task::none();
+                };
+                if drag.moved || measure_id != drag.origin {
+                    drag.moved = true;
+                    // preview only: the player follows on release
+                    let first = drag.anchor.min(measure_id);
+                    let last = drag.anchor.max(measure_id);
+                    tablature.set_loop_range(Some((first, last)));
+                }
+                Task::none()
+            }
+            Message::DragEnd => match self.loop_drag.take() {
+                Some(LoopDrag { moved: true, .. }) => {
+                    let loop_range = self.tablature.as_ref().and_then(Tablature::loop_range);
+                    self.set_loop_range(loop_range)
+                }
+                _ => Task::none(),
+            },
             Message::WindowResized => {
                 // query tablature container size
                 selector::find(self.tablature_id.clone()).then(|target| {
@@ -659,6 +767,15 @@ impl RuxApplication {
                 self.count_in_enabled,
             );
 
+            let loop_mode = action_toggle(
+                loop_icon(),
+                "Loop (L) \u{2022} drag across measures to select, shift+click to add or remove",
+                Message::ToggleLoop,
+                self.tablature
+                    .as_ref()
+                    .is_some_and(|t| t.loop_range().is_some()),
+            );
+
             let track_pick_list = pick_list(
                 self.all_tracks.as_slice(),
                 Some(&self.track_selection),
@@ -683,6 +800,7 @@ impl RuxApplication {
                 volume_slider,
                 metronome_mode,
                 count_in_mode,
+                loop_mode,
                 solo_mode,
                 mute_mode,
                 track_pick_list,
@@ -789,7 +907,7 @@ impl RuxApplication {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let mut subscriptions = Vec::with_capacity(4);
+        let mut subscriptions = Vec::with_capacity(5);
 
         // keyboard event subscription
         let keyboard_subscription = keyboard::listen().filter_map(|event| {
@@ -817,6 +935,9 @@ impl RuxApplication {
                 keyboard::Key::Character(c) if c.eq_ignore_ascii_case("m") => {
                     Some(Message::ToggleMute)
                 }
+                keyboard::Key::Character(c) if c.eq_ignore_ascii_case("l") => {
+                    Some(Message::ToggleLoop)
+                }
                 keyboard::Key::Named(F11) => Some(Message::ToggleFullscreen),
                 _ => None,
             }
@@ -831,6 +952,18 @@ impl RuxApplication {
 
         let window_resized = window::resize_events().map(|_| Message::WindowResized);
         subscriptions.push(window_resized);
+
+        // a loop drag ends wherever the button is released
+        let mouse_released = iced::event::listen_with(|event, _status, _window| {
+            matches!(
+                event,
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left
+                ))
+            )
+            .then_some(Message::DragEnd)
+        });
+        subscriptions.push(mouse_released);
 
         let file_dropped = window::events().filter_map(|(_, event)| {
             if let window::Event::FileDropped(path) = event {

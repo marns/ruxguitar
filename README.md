@@ -15,6 +15,7 @@ The design of the application is described in details in the blog article "[Play
 - MIDI playback with embedded soundfont (or custom soundfont)
 - Repeat sections with alternative endings
 - Tempo control (25% to 200%)
+- Loop a measure or a range of measures: drag across measures to select them, drag an end of the loop to move it, shift+click to add or remove measures
 - Solo mode (isolate single track)
 - Track selection
 - Keyboard shortcuts:
@@ -22,6 +23,7 @@ The design of the application is described in details in the blog article "[Play
     - `Ctrl+Up` / `Ctrl+Down` tempo up/down
     - `Left` / `Right` previous/next measure
     - `S` toggle solo
+    - `L` loop the current measure / stop looping
     - `F11` toggle fullscreen
 - Open files via the picker or drag-and-drop
 

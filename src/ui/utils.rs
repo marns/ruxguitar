@@ -48,6 +48,7 @@ pub fn untitled_text_table_box() -> Container<'static, Message> {
         - use ctrl+up/down to change the tempo\n \
         - use left/right to navigate measures\n \
         - use s to toggle solo mode\n \
+        - use l to loop the current measure, drag across measures to loop them\n \
         - use F11 to toggle fullscreen";
     let text = Text::new(message);
 
