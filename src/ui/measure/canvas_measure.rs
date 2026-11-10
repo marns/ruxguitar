@@ -16,6 +16,7 @@ use crate::ui::application::Message;
 use crate::ui::utils::TablatureColors;
 use iced::advanced::mouse;
 use iced::advanced::text::Shaping::Auto;
+use iced::keyboard;
 use iced::mouse::Cursor;
 use iced::widget::canvas::{Cache, Event, Frame, Geometry, Text};
 use iced::widget::{Action, Canvas, canvas};
@@ -458,11 +459,10 @@ impl CanvasMeasure {
     }
 }
 
+/// Whether shift is held, so a press edits the selection instead.
 #[derive(Debug, Default)]
-pub enum MeasureInteraction {
-    #[default]
-    None,
-    Clicked,
+pub struct MeasureInteraction {
+    shift: bool,
 }
 
 impl canvas::Program<Message> for CanvasMeasure {
@@ -476,13 +476,22 @@ impl canvas::Program<Message> for CanvasMeasure {
         cursor: Cursor,
     ) -> Option<Action<Message>> {
         match event {
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.shift = modifiers.shift();
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if state.shift && cursor.position_in(bounds).is_some() =>
+            {
+                return Some(Action::publish(Message::SelectionShiftClick(
+                    self.measure_id,
+                )));
+            }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
                 if cursor.position_in(bounds).is_some() =>
             {
                 let cursor_position = cursor.position_in(bounds).unwrap();
                 let beat_id = self.beat_at_x(cursor_position.x, bounds.width);
                 let press_position = cursor.position().expect("cursor inside measure bounds");
-                *state = MeasureInteraction::Clicked;
                 return Some(Action::publish(Message::SelectionDragStart(
                     self.measure_id,
                     beat_id,

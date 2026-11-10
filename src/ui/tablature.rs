@@ -260,9 +260,44 @@ impl Tablature {
         self.selection
     }
 
+    /// A press on `measure_id` starts a drag. Grabbing an end of a
+    /// multi-measure selection moves that end, anywhere else starts afresh.
     pub fn begin_selection_drag(&mut self, measure_id: usize) {
-        self.selection_anchor = measure_id;
-        self.clear_selection();
+        match self.selection {
+            Some((start, end)) if start != end && measure_id == start => {
+                self.selection_anchor = end;
+            }
+            Some((start, end)) if start != end && measure_id == end => {
+                self.selection_anchor = start;
+            }
+            _ => {
+                self.selection_anchor = measure_id;
+                self.clear_selection();
+            }
+        }
+    }
+
+    /// Shift+click on `measure_id`: a measure outside the selection extends
+    /// it, one inside drops itself and everything up to the nearer end (the
+    /// last end on a tie). Without a selection, it spans from the focused
+    /// measure.
+    pub fn shift_click_selection(&mut self, measure_id: usize) {
+        let Some((start, end)) = self.selection else {
+            self.selection_anchor = self.focused_measure;
+            self.apply_selection_range(self.focused_measure, measure_id);
+            return;
+        };
+        if measure_id < start {
+            self.apply_selection_range(measure_id, end);
+        } else if measure_id > end {
+            self.apply_selection_range(start, measure_id);
+        } else if start == end {
+            self.clear_selection();
+        } else if measure_id - start < end - measure_id {
+            self.apply_selection_range(measure_id + 1, end);
+        } else {
+            self.apply_selection_range(start, measure_id - 1);
+        }
     }
 
     pub fn extend_selection_drag(&mut self, measure_id: usize) {
@@ -534,6 +569,48 @@ mod tests {
         tab.begin_selection_drag(4);
         assert_eq!(tab.selection_range(), None);
         assert!(selected_measures(&tab).is_empty());
+    }
+
+    #[test]
+    fn dragging_a_selection_end_moves_that_end() {
+        let mut tab = load_tablature(800.0, 600.0);
+        tab.restore_selection(2, 5);
+        tab.begin_selection_drag(2);
+        assert_eq!(tab.selection_range(), Some((2, 5)));
+        tab.extend_selection_drag(4);
+        assert_eq!(tab.selection_range(), Some((4, 5)));
+        tab.begin_selection_drag(5);
+        tab.extend_selection_drag(7);
+        assert_eq!(tab.selection_range(), Some((4, 7)));
+        assert_eq!(selected_measures(&tab), [4, 5, 6, 7]);
+        // the middle starts a new selection
+        tab.begin_selection_drag(5);
+        assert_eq!(tab.selection_range(), None);
+    }
+
+    #[test]
+    fn shift_click_extends_and_trims_the_selection() {
+        let mut tab = load_tablature(800.0, 600.0);
+        let mut shift_click = |selection: Option<(usize, usize)>, measure_id| {
+            match selection {
+                Some((start, end)) => tab.restore_selection(start, end),
+                None => tab.clear_selection(),
+            }
+            tab.shift_click_selection(measure_id);
+            tab.selection_range()
+        };
+        // no selection: from the focused measure
+        assert_eq!(shift_click(None, 3), Some((0, 3)));
+        // outside: extend on either side
+        assert_eq!(shift_click(Some((4, 8)), 2), Some((2, 8)));
+        assert_eq!(shift_click(Some((4, 8)), 10), Some((4, 10)));
+        // inside: drop the clicked measure and those up to the nearer end
+        assert_eq!(shift_click(Some((4, 8)), 4), Some((5, 8)));
+        assert_eq!(shift_click(Some((4, 8)), 5), Some((6, 8)));
+        assert_eq!(shift_click(Some((4, 8)), 8), Some((4, 7)));
+        assert_eq!(shift_click(Some((4, 8)), 6), Some((4, 5)));
+        // the only selected measure ends the selection
+        assert_eq!(shift_click(Some((4, 4)), 4), None);
     }
 
     #[test]

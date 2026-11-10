@@ -105,6 +105,7 @@ pub enum Message {
     SelectionDragStart(usize, usize, Point),
     SelectionDragTo(usize, Point),
     SelectionDragEnd,
+    SelectionShiftClick(usize),
     FocusTick(u32),
     NextMeasure,
     PreviousMeasure,
@@ -465,6 +466,25 @@ impl RuxApplication {
         focus_task
     }
 
+    /// Shift+click reshapes the selection, keeping a running loop in step.
+    /// Playback stays where it is unless the selection moved away from it.
+    fn on_selection_shift_click(&mut self, measure_id: usize) -> Task<Message> {
+        let Some(LoadedSong { tablature, .. }) = &mut self.song else {
+            return Task::none();
+        };
+        tablature.shift_click_selection(measure_id);
+        let outside = tablature
+            .selection_range()
+            .is_some_and(|(start, end)| !(start..=end).contains(&tablature.focused_measure()));
+        let loop_start = self.sync_measure_loop();
+        let task = match loop_start {
+            Some(start) if outside => self.focus_measure_with_scroll(start),
+            _ => Task::none(),
+        };
+        self.persist_session();
+        task
+    }
+
     fn on_play_pause(&mut self) -> Task<Message> {
         if self.tab_file_is_loading {
             return Task::none();
@@ -547,6 +567,7 @@ impl RuxApplication {
                 Task::none()
             }
             Message::SelectionDragEnd => self.on_selection_drag_end(),
+            Message::SelectionShiftClick(measure_id) => self.on_selection_shift_click(measure_id),
             Message::FocusTick(tick) => {
                 // the song ran out: stop the transport rather than leave it
                 // playing silence
